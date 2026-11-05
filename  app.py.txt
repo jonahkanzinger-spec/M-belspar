@@ -1,0 +1,71 @@
+import os, sqlite3, base64
+from flask import Flask, render_template, request
+import requests
+
+app = Flask(__name__)
+
+EBAY_CLIENT_ID = os.environ.get("EBAY_CLIENT_ID", "DEIN_CLIENT_ID")
+EBAY_CLIENT_SECRET = os.environ.get("EBAY_CLIENT_SECRET", "DEIN_CLIENT_SECRET")
+EBAY_ENV = "https://api.ebay.com"
+
+IKEA_PREISE = {
+    "billy": 49.00, "pax": 499.00, "malm": 129.00,
+    "hemnes": 179.00, "klippan": 229.00, "kallax": 69.00,
+    "bestå": 149.00, "poäng": 129.00, "ektorp": 599.00,
+}
+
+# DB erstellen
+conn = sqlite3.connect("alarme.db")
+conn.execute("CREATE TABLE IF NOT EXISTS alarme (id INTEGER PRIMARY KEY, email TEXT, suchbegriff TEXT, zielpreis REAL, aktiv INTEGER DEFAULT 1)")
+conn.close()
+
+def get_ebay_token():
+    auth = base64.b64encode(f"{EBAY_CLIENT_ID}:{EBAY_CLIENT_SECRET}".encode()).decode()
+    r = requests.post(f"{EBAY_ENV}/identity/v1/oauth2/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Authorization": f"Basic {auth}"},
+        data={"grant_type": "client_credentials", "scope": "https://api.ebay.com/oauth/api_scope"})
+    return r.json().get("access_token")
+
+def suche_ebay(query):
+    token = get_ebay_token()
+    if not token: return []
+    r = requests.get(f"{EBAY_ENV}/buy/browse/v1/item_summary/search",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"q": f"{query} gebraucht", "category_ids": "139395", "filter": "conditions:{USED},deliveryCountry:DE", "sort": "price", "limit": "10"})
+    if r.status_code != 200: return []
+    ergebnisse = []
+    for item in r.json().get("itemSummaries", []):
+        ergebnisse.append({
+            "titel": item.get("title"),
+            "preis": item.get("price", {}).get("value"),
+            "bild": item.get("image", {}).get("imageUrl"),
+            "link": item.get("itemWebUrl"),
+            "ort": item.get("itemLocation", {}).get("city", "Deutschland")
+        })
+    return ergebnisse
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    ergebnisse, neu_preis, suchbegriff, kleinanzeigen_link = [], None, "", ""
+    if request.method == "POST":
+        suchbegriff = request.form.get("suchbegriff", "").lower().strip()
+        for key, preis in IKEA_PREISE.items():
+            if key in suchbegriff:
+                neu_preis = preis
+                break
+        ergebnisse = suche_ebay(suchbegriff)
+        kleinanzeigen_link = f"https://www.kleinanzeigen.de/s-{suchbegriff.replace(' ', '-')}/k0"
+    return render_template("index.html", ergebnisse=ergebnisse, neu_preis=neu_preis, suchbegriff=suchbegriff, kleinanzeigen_link=kleinanzeigen_link)
+
+@app.route("/alarm", methods=["POST"])
+def alarm():
+    email = request.form.get("email")
+    suchbegriff = request.form.get("suchbegriff")
+    zielpreis = float(request.form.get("zielpreis"))
+    conn = sqlite3.connect("alarme.db")
+    conn.execute("INSERT INTO alarme (email, suchbegriff, zielpreis) VALUES (?, ?, ?)", (email, suchbegriff, zielpreis))
+    conn.commit(); conn.close()
+    return f"Danke! Wir melden uns bei {email} sobald '{suchbegriff}' unter {zielpreis} € fällt. <br><br><a href='/'>Zurück</a>"
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)

@@ -1,0 +1,41 @@
+import sqlite3, requests, base64, smtplib, os
+from email.mime.text import MIMEText
+
+EBAY_CLIENT_ID = os.environ.get("EBAY_CLIENT_ID")
+EBAY_CLIENT_SECRET = os.environ.get("EBAY_CLIENT_SECRET")
+EBAY_ENV = "https://api.ebay.com"
+ABSENDER_MAIL = os.environ.get("ABSENDER_MAIL", "deine@mail.de")
+ABSENDER_PASSWORT = os.environ.get("ABSENDER_PASSWORT", "DEIN_APP_PASSWORT")
+
+def get_token():
+    auth = base64.b64encode(f"{EBAY_CLIENT_ID}:{EBAY_CLIENT_SECRET}".encode()).decode()
+    r = requests.post(f"{EBAY_ENV}/identity/v1/oauth2/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Authorization": f"Basic {auth}"},
+        data={"grant_type": "client_credentials", "scope": "https://api.ebay.com/oauth/api_scope"})
+    return r.json().get("access_token")
+
+def check_preis(query):
+    token = get_token()
+    r = requests.get(f"{EBAY_ENV}/buy/browse/v1/item_summary/search",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"q": f"{query} gebraucht", "category_ids": "139395", "filter": "conditions:{USED},deliveryCountry:DE", "sort": "price", "limit": "1"})
+    items = r.json().get("itemSummaries", [])
+    if items:
+        return float(items[0]["price"]["value"]), items[0]["itemWebUrl"]
+    return None, None
+
+conn = sqlite3.connect("alarme.db")
+cur = conn.cursor()
+cur.execute("SELECT id, email, suchbegriff, zielpreis FROM alarme WHERE aktiv=1")
+for alarm_id, email, suchbegriff, zielpreis in cur.fetchall():
+    preis, link = check_preis(suchbegriff)
+    if preis and preis <= zielpreis:
+        msg = MIMEText(f"Gute Nachricht! '{suchbegriff}' ist jetzt für {preis} € verfügbar.\n\nHier ansehen: {link}\n\n- Dein MöbelSpar Alarm")
+        msg["Subject"] = f"Preis-Alarm: {suchbegriff} jetzt {preis} €"
+        msg["From"] = ABSENDER_MAIL; msg["To"] = email
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(ABSENDER_MAIL, ABSENDER_PASSWORT)
+            server.send_message(msg)
+        cur.execute("UPDATE alarme SET aktiv=0 WHERE id=?", (alarm_id,)); conn.commit()
+conn.close()
+print("Check fertig")
